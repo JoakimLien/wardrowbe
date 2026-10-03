@@ -720,3 +720,23 @@ def get_ai_service() -> AIService:
     if _ai_service is None:
         _ai_service = AIService()
     return _ai_service
+
+
+class AIResponseTruncatedError(RuntimeError):
+    """Raised when a model's response was cut off before it produced any output content."""
+
+
+def require_internal_ai(capability: Literal["vision", "text"]) -> None:
+    """Raise AIDisabledError if the given internal-AI capability is disabled.
+
+    Call before constructing AIService directly so deferred work never builds a
+    client or reaches a provider.
+    """
+    settings = get_settings()
+    enabled = (
+        settings.effective_ai_vision_enabled
+        if capability == "vision"
+        else settings.effective_ai_text_enabled
+    )
+    if not enabled:
+        raise AIDisabledError(f"Internal AI {capability} is disabled; defer to an external agent.")
