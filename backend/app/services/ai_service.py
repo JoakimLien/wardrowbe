@@ -321,12 +321,17 @@ class AIService:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    def _preprocess_image(self, image_path: str | Path) -> str:
+    def _preprocess_image(self, image_source: str | Path | bytes) -> str:
         """
         Preprocess image for AI analysis.
+        Accepts a file path (str or Path) or raw image bytes.
         Returns base64-encoded JPEG string.
         """
-        with Image.open(image_path) as img:
+        # Wrap bytes in BytesIO for PIL to read
+        if isinstance(image_source, bytes):
+            image_source = io.BytesIO(image_source)
+        
+        with Image.open(image_source) as img:
             # Convert to RGB if necessary
             if img.mode != "RGB":
                 img = img.convert("RGB")
@@ -569,10 +574,19 @@ class AIService:
 
         return None, last_error, None
 
-    async def analyze_image(self, image_path: str | Path) -> ClothingTags:
+    async def analyze_image(self, image: str | Path | bytes) -> ClothingTags:
+        """
+        Analyze an image and return clothing tags.
+        
+        Args:
+            image: File path (str or Path) or raw image bytes
+        
+        Returns:
+            ClothingTags object with analysis results
+        """
         # PIL preprocessing is CPU-bound and synchronous; run off the event loop so
         # concurrent tagging jobs don't stall each other's in-flight HTTP reads.
-        image_base64 = await asyncio.to_thread(self._preprocess_image, image_path)
+        image_base64 = await asyncio.to_thread(self._preprocess_image, image)
 
         # System/user separation for injection protection
         messages_tags = [
@@ -657,235 +671,34 @@ class AIService:
                         )
                         continue
 
-                    # Fallback: Try Ollama-specific endpoint
-                    response = await client.get(endpoint.url.replace("/v1", "/api/tags"))
-                    if response.status_code == 200:
-                        models = response.json().get("models", [])
-                        model_names = [m.get("name", "") for m in models]
-                        endpoints_health.append(
-                            {
-                                "name": endpoint.name,
-                                "url": endpoint.url,
-                                "status": "healthy",
-                                "vision_model": endpoint.vision_model,
-                                "text_model": endpoint.text_model,
-                                "available_models": model_names,
-                            }
-                        )
-                    else:
-                        endpoints_health.append(
-                            {
-                                "name": endpoint.name,
-                                "url": endpoint.url,
-                                "status": "unhealthy",
-                                "error": f"HTTP {response.status_code}",
-                            }
-                        )
+                    # Try OpenAI endpoint styles that return 404 for /models
+                    logger.debug(
+                        f"{endpoint.name} returned {response.status_code} for /models, "
+                        f"assuming offline or incompatible"
+                    )
+                    endpoints_health.append(
+                        {
+                            "name": endpoint.name,
+                            "url": endpoint.url,
+                            "status": "unknown",
+                            "vision_model": endpoint.vision_model,
+                            "text_model": endpoint.text_model,
+                            "available_models": [],
+                        }
+                    )
             except Exception as e:
+                logger.warning(f"Health check failed for {endpoint.name}: {e}")
                 endpoints_health.append(
                     {
                         "name": endpoint.name,
                         "url": endpoint.url,
-                        "status": "unhealthy",
+                        "status": "offline",
                         "error": str(e),
                     }
                 )
 
-        # Overall status is healthy if at least one endpoint is healthy
-        any_healthy = any(ep["status"] == "healthy" for ep in endpoints_health)
         return {
-            "status": "healthy" if any_healthy else "unhealthy",
+            "status": "healthy" if any(h.get("status") == "healthy" for h in endpoints_health) else "offline",
             "endpoints": endpoints_health,
         }
 
-    async def generate_text(
-        self,
-        prompt: str,
-        system_prompt: str | None = None,
-        return_metadata: bool = False,
-    ) -> str | TextGenerationResult:
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
-
-        last_error = None
-
-        for endpoint in self._endpoints:
-            logger.info(f"Trying text generation via {endpoint.name}")
-
-            use_reasoning_effort = bool(self.settings.ai_reasoning_effort)
-            current_reasoning_effort = self.settings.ai_reasoning_effort
-
-            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-                for attempt in range(self.settings.ai_max_retries):
-                    try:
-                        request_body = {
-                            "model": endpoint.text_model,
-                            "messages": messages,
-                            "stream": False,
-                            "temperature": 0.4,
-                            "max_tokens": self.settings.ai_max_tokens,
-                        }
-                        if use_reasoning_effort and current_reasoning_effort:
-                            request_body["reasoning_effort"] = current_reasoning_effort
-
-                        response = await client.post(
-                            f"{endpoint.url}/chat/completions",
-                            headers=self._get_headers(),
-                            json=request_body,
-                        )
-                        response.raise_for_status()
-
-                        data = response.json()
-                        provider_error = _provider_error_message(data)
-                        if provider_error is not None:
-                            if use_reasoning_effort and _message_rejects_reasoning_effort(
-                                provider_error
-                            ):
-                                logger.warning(
-                                    f"{endpoint.name} rejected reasoning_effort, "
-                                    f"retrying without it: {provider_error}"
-                                )
-                                use_reasoning_effort = False
-                                continue
-                            raise _AIProviderResponseError(provider_error)
-                        used_model = data.get("model", endpoint.text_model)
-                        choice = data["choices"][0]
-                        message = choice["message"]
-                        content = message.get("content")
-
-                        if not content or not content.strip():
-                            finish_reason = choice.get("finish_reason")
-                            reasoning = message.get("reasoning_content") or message.get("reasoning")
-                            if finish_reason == "length" and reasoning:
-                                detail = (
-                                    "its reasoning/thinking output consumed the entire "
-                                    "completion token budget before it produced a response"
-                                )
-                            elif finish_reason == "length":
-                                detail = "the response was cut off before any content was generated"
-                            else:
-                                detail = f"finish_reason={finish_reason!r}"
-                            last_error = AIResponseTruncatedError(
-                                f"{endpoint.name} (model: {used_model}) returned an empty "
-                                f"response: {detail}. Try raising AI_MAX_TOKENS (currently "
-                                f"{self.settings.ai_max_tokens}) or disabling extended "
-                                "thinking/reasoning mode for this model."
-                            )
-                            logger.warning(str(last_error))
-
-                            # Drop straight to no reasoning rather than replaying the same
-                            # truncated request, which is what turned a single slow call into
-                            # a multi-minute hang. Only worth trying while the endpoint still
-                            # accepts the parameter at all.
-                            if (
-                                reasoning
-                                and use_reasoning_effort
-                                and current_reasoning_effort != "none"
-                            ):
-                                logger.info(
-                                    f"Retrying text generation via {endpoint.name} with "
-                                    "reasoning_effort='none' to prevent truncation"
-                                )
-                                current_reasoning_effort = "none"
-                                continue
-
-                            # A length cutoff with reasoning already at its floor is
-                            # deterministic, so retrying only multiplies the wait. Any other
-                            # empty response can be transient (temperature is non-zero), so
-                            # it keeps the normal retry budget.
-                            if finish_reason == "length":
-                                break
-                            if attempt < self.settings.ai_max_retries - 1:
-                                continue
-                            break
-
-                        logger.info(
-                            f"Text generation successful via {endpoint.name} (model: {used_model})"
-                        )
-
-                        if return_metadata:
-                            return TextGenerationResult(
-                                content=content,
-                                model=used_model,
-                                endpoint=endpoint.name,
-                            )
-                        return content
-
-                    except _AIProviderResponseError as e:
-                        last_error = e
-                        logger.warning(f"Provider error from {endpoint.name}: {e}")
-                        if attempt < self.settings.ai_max_retries - 1:
-                            continue
-                    except httpx.HTTPStatusError as e:
-                        if use_reasoning_effort and _response_rejects_reasoning_effort(e.response):
-                            logger.warning(
-                                f"{endpoint.name} rejected reasoning_effort, retrying without it: {e}"
-                            )
-                            use_reasoning_effort = False
-                            continue
-                        last_error = e
-                        logger.warning(f"HTTP error from {endpoint.name}: {e}")
-                        if attempt < self.settings.ai_max_retries - 1:
-                            continue
-                    except httpx.RequestError as e:
-                        last_error = e
-                        logger.warning(f"Request error from {endpoint.name}: {e}")
-                        if attempt < self.settings.ai_max_retries - 1:
-                            continue
-
-        if last_error:
-            raise last_error
-        raise RuntimeError("Failed to generate text - no endpoints available")
-
-
-class AIResponseTruncatedError(RuntimeError):
-    """Raised when a model's response was cut off before it produced any output content.
-
-    Reasoning-capable models (e.g. Qwen3, DeepSeek-R1) return their chain-of-thought in a
-    separate ``reasoning_content`` field, distinct from ``content``. If that reasoning
-    consumes the entire completion token budget, the API reports ``finish_reason ==
-    "length"`` with an empty ``content`` string. Downstream JSON parsing of an empty
-    string then fails with an unhelpful message, which used to get swallowed into a
-    generic "AI service is not available" error even though the endpoint responded
-    successfully. This error preserves the real cause so callers can surface it.
-    """
-
-
-class AIDisabledError(RuntimeError):
-    """Raised when an internal AI client is requested while that capability is off."""
-
-
-def require_internal_ai(capability: Literal["vision", "text"]) -> None:
-    """Raise AIDisabledError if the given internal-AI capability is disabled.
-
-    Call before constructing AIService directly so deferred work never builds a
-    client or reaches a provider.
-    """
-    settings = get_settings()
-    enabled = (
-        settings.effective_ai_vision_enabled
-        if capability == "vision"
-        else settings.effective_ai_text_enabled
-    )
-    if not enabled:
-        raise AIDisabledError(
-            f"Internal AI {capability} is disabled "
-            f"(AI_INTERNAL_ENABLED / AI_{capability.upper()}_ENABLED=false). "
-            "Defer this work to an external agent."
-        )
-
-
-# Singleton instance
-_ai_service: AIService | None = None
-
-
-def get_ai_service() -> AIService:
-    """Return the shared AIService, or raise AIDisabledError if internal AI is off."""
-    if not get_settings().ai_enabled:
-        raise AIDisabledError("Internal AI is disabled; defer to an external agent.")
-    global _ai_service
-    if _ai_service is None:
-        _ai_service = AIService()
-    return _ai_service
