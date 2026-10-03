@@ -34,6 +34,17 @@ def _image_bytes(i: int = 0) -> bytes:
     return buf.getvalue()
 
 
+@pytest.fixture(autouse=True)
+def _stub_image_fetch():
+    # The worker fetches images from the backend over HTTP; stub the network call.
+    with patch(
+        "app.workers.tagging.fetch_image_bytes",
+        new_callable=AsyncMock,
+        return_value=_image_bytes(),
+    ):
+        yield
+
+
 class _OrderRecorder:
     def __init__(self):
         self.events: list[str] = []

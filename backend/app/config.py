@@ -104,6 +104,9 @@ class Settings(BaseSettings):
     smtp_password: str | None = None
     # Storage
     storage_path: str = Field(default="/data/wardrobe")
+    # Base URL the worker uses to fetch images from the backend. Volumes are
+    # per-service on Railway, so the worker cannot read the backend's files.
+    backend_internal_url: str = Field(default="http://wardrowbe-backend.railway.internal:8000")
     max_upload_size_mb: int = Field(default=10)
     max_bulk_upload_count: int = Field(default=20)
     # Byte size is a poor proxy for decode cost: a 3.8MB JPEG can be 108MP,
