@@ -321,12 +321,14 @@ class AIService:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    def _preprocess_image(self, image_path: str | Path) -> str:
+    def _preprocess_image(self, image_source: str | Path | bytes) -> str:
         """
         Preprocess image for AI analysis.
+        Accepts a file path or raw image bytes.
         Returns base64-encoded JPEG string.
         """
-        with Image.open(image_path) as img:
+        source = io.BytesIO(image_source) if isinstance(image_source, bytes) else image_source
+        with Image.open(source) as img:
             # Convert to RGB if necessary
             if img.mode != "RGB":
                 img = img.convert("RGB")
@@ -569,10 +571,10 @@ class AIService:
 
         return None, last_error, None
 
-    async def analyze_image(self, image_path: str | Path) -> ClothingTags:
+    async def analyze_image(self, image: str | Path | bytes) -> ClothingTags:
         # PIL preprocessing is CPU-bound and synchronous; run off the event loop so
         # concurrent tagging jobs don't stall each other's in-flight HTTP reads.
-        image_base64 = await asyncio.to_thread(self._preprocess_image, image_path)
+        image_base64 = await asyncio.to_thread(self._preprocess_image, image)
 
         # System/user separation for injection protection
         messages_tags = [

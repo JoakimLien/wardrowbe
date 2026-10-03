@@ -1,10 +1,10 @@
 import asyncio
 import logging
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import httpx
 from arq import Retry
 from sqlalchemy import select, update
 
@@ -12,11 +12,13 @@ from app.config import get_settings
 from app.models.item import ClothingItem, ItemStatus, TaggedBy, TaggingStatus
 from app.models.preference import UserPreference
 from app.services.ai_service import AIService, ClothingTags
+from app.utils.signed_urls import sign_image_url
 from app.workers.db import get_db_session
 
 logger = logging.getLogger(__name__)
 
 TAGGING_MAX_TRIES = 3
+IMAGE_FETCH_TIMEOUT_SECONDS = 30
 
 # Margin left below job_timeout so the in-job call budget always fires before
 # arq's own kill (which does not retry - see _tagging_call_budget).
@@ -175,6 +177,40 @@ async def update_item_status_to_error(ctx: dict, item_id: str, error_msg: str) -
         logger.error(f"Failed to update item {item_id} status to error: {e}")
 
 
+class ImageNotFoundError(Exception):
+    """The backend has no image at the requested path (HTTP 404)."""
+
+
+def relative_image_path(image_path: str) -> str:
+    """Normalize a queued image path to `user_id/filename.jpg`.
+
+    Older jobs carry an absolute path under the storage root; strip that prefix.
+    """
+    storage_root = get_settings().storage_path.rstrip("/")
+    if storage_root and image_path.startswith(storage_root + "/"):
+        image_path = image_path[len(storage_root) + 1 :]
+    return image_path.lstrip("/")
+
+
+async def fetch_image_bytes(image_path: str) -> bytes:
+    """Fetch image bytes from the backend's image endpoint.
+
+    Raises ImageNotFoundError on 404. Other HTTP errors and network failures
+    propagate as httpx exceptions so the caller's retry handling applies.
+    """
+    settings = get_settings()
+    relative = relative_image_path(image_path)
+    # Signed because the worker has no user session; the backend verifies the
+    # signature with the shared secret key.
+    url = f"{settings.backend_internal_url.rstrip('/')}{sign_image_url(relative)}"
+    async with httpx.AsyncClient(timeout=IMAGE_FETCH_TIMEOUT_SECONDS) as client:
+        response = await client.get(url)
+    if response.status_code == 404:
+        raise ImageNotFoundError(relative)
+    response.raise_for_status()
+    return response.content
+
+
 async def tag_item_image(ctx: dict, item_id: str, image_path: str) -> dict[str, Any]:
     """
     Analyze an item's image and update it with AI-generated tags.
@@ -182,7 +218,9 @@ async def tag_item_image(ctx: dict, item_id: str, image_path: str) -> dict[str, 
     Args:
         ctx: arq context
         item_id: UUID of the item to tag
-        image_path: Path to the image file
+        image_path: Image path relative to storage (user_id/filename.jpg). Absolute
+            paths under the storage root from jobs enqueued by older versions are
+            also accepted.
 
     Returns:
         Dict with status and tags
@@ -195,9 +233,11 @@ async def tag_item_image(ctx: dict, item_id: str, image_path: str) -> dict[str, 
         return {"status": "skipped", "reason": "vision disabled", "item_id": item_id}
 
     try:
-        # Verify image exists
-        path = Path(image_path)
-        if not path.exists():
+        # Fetch the image from the backend over HTTP. Volumes are per-service, so
+        # the worker cannot read the backend's files from disk.
+        try:
+            image_bytes = await fetch_image_bytes(image_path)
+        except ImageNotFoundError:
             error_msg = f"Image not found: {image_path}"
             logger.error(error_msg)
             await update_item_status_to_error(ctx, item_id, error_msg)
@@ -238,7 +278,7 @@ async def tag_item_image(ctx: dict, item_id: str, image_path: str) -> dict[str, 
         # Analyze with AI (uses custom endpoints if available)
         ai_service = AIService(endpoints=ai_endpoints)
         tags = await asyncio.wait_for(
-            ai_service.analyze_image(path), timeout=_tagging_call_budget(ai_service)
+            ai_service.analyze_image(image_bytes), timeout=_tagging_call_budget(ai_service)
         )
 
         logger.info(
