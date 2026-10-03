@@ -1,10 +1,12 @@
 import asyncio
 import logging
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import httpx
 from arq import Retry
 from sqlalchemy import select, update
 
@@ -12,9 +14,62 @@ from app.config import get_settings
 from app.models.item import ClothingItem, ItemStatus, TaggedBy, TaggingStatus
 from app.models.preference import UserPreference
 from app.services.ai_service import AIService, ClothingTags
+from app.utils.signed_urls import sign_image_url
 from app.workers.db import get_db_session
 
 logger = logging.getLogger(__name__)
+
+IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 30
+
+
+class ImageNotFoundError(Exception):
+    """The image is neither on the local filesystem nor served by the backend."""
+
+
+async def _download_image(relative_path: str) -> Path:
+    """Fetch an image from the backend over HTTP into a temp file.
+
+    The caller owns the returned file and must delete it.
+    """
+    settings = get_settings()
+    relative = relative_path.lstrip("/")
+    url = settings.backend_internal_url.rstrip("/") + sign_image_url(relative)
+    suffix = Path(relative).suffix or ".jpg"
+
+    async with httpx.AsyncClient(timeout=IMAGE_DOWNLOAD_TIMEOUT_SECONDS) as client:
+        response = await client.get(url)
+    if response.status_code == 404:
+        raise ImageNotFoundError(f"Image not found: {relative}")
+    response.raise_for_status()
+
+    fd, tmp_name = tempfile.mkstemp(prefix="wardrowbe-tag-", suffix=suffix)
+    tmp_path = Path(tmp_name)
+    try:
+        with open(fd, "wb") as f:
+            f.write(response.content)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return tmp_path
+
+
+async def _resolve_image(image_path: str) -> tuple[Path, bool]:
+    """Return (path, is_temporary) for an image.
+
+    Uses the local file when it is reachable (shared-filesystem deployments and
+    legacy absolute-path jobs); otherwise downloads it from the backend.
+    """
+    storage_path = get_settings().storage_path
+    candidate = Path(image_path)
+    if not candidate.is_absolute():
+        candidate = Path(storage_path) / image_path
+    if candidate.is_file():
+        return candidate, False
+    # Legacy jobs carry the full storage path; strip it to get the relative path.
+    storage_prefix = storage_path.rstrip("/") + "/"
+    relative = image_path.removeprefix(storage_prefix)
+    return await _download_image(relative), True
+
 
 TAGGING_MAX_TRIES = 3
 
@@ -182,7 +237,8 @@ async def tag_item_image(ctx: dict, item_id: str, image_path: str) -> dict[str, 
     Args:
         ctx: arq context
         item_id: UUID of the item to tag
-        image_path: Path to the image file
+        image_path: Image path relative to the storage root (user_id/filename.jpg).
+            Fetched from the backend over HTTP unless available locally.
 
     Returns:
         Dict with status and tags
@@ -195,14 +251,6 @@ async def tag_item_image(ctx: dict, item_id: str, image_path: str) -> dict[str, 
         return {"status": "skipped", "reason": "vision disabled", "item_id": item_id}
 
     try:
-        # Verify image exists
-        path = Path(image_path)
-        if not path.exists():
-            error_msg = f"Image not found: {image_path}"
-            logger.error(error_msg)
-            await update_item_status_to_error(ctx, item_id, error_msg)
-            return {"status": "error", "error": "Image not found"}
-
         # Get user's AI endpoints from preferences, and mark this attempt as started
         ai_endpoints = None
         db = get_db_session(ctx)
@@ -237,9 +285,24 @@ async def tag_item_image(ctx: dict, item_id: str, image_path: str) -> dict[str, 
 
         # Analyze with AI (uses custom endpoints if available)
         ai_service = AIService(endpoints=ai_endpoints)
-        tags = await asyncio.wait_for(
-            ai_service.analyze_image(path), timeout=_tagging_call_budget(ai_service)
-        )
+
+        # Use the local file if reachable, otherwise fetch it from the backend over
+        # HTTP (per-service volumes mean the worker cannot see the backend's files).
+        try:
+            path, is_temp = await _resolve_image(image_path)
+        except ImageNotFoundError as e:
+            error_msg = str(e)
+            logger.error(error_msg)
+            await update_item_status_to_error(ctx, item_id, error_msg)
+            return {"status": "error", "error": "Image not found"}
+
+        try:
+            tags = await asyncio.wait_for(
+                ai_service.analyze_image(path), timeout=_tagging_call_budget(ai_service)
+            )
+        finally:
+            if is_temp:
+                path.unlink(missing_ok=True)
 
         logger.info(
             f"AI analysis complete for item {item_id}: type={tags.type}, color={tags.primary_color}"

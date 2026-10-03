@@ -251,11 +251,10 @@ async def create_item(
         try:
             redis = await create_pool(get_redis_settings())
             try:
-                full_image_path = f"{settings.storage_path}/{image_paths['image_path']}"
                 job = await redis.enqueue_job(
                     "tag_item_image",
                     str(item.id),
-                    full_image_path,
+                    image_paths["image_path"],
                     _queue_name=TAGGING_QUEUE,
                 )
                 item.ai_job_id = job.job_id
@@ -407,11 +406,10 @@ async def bulk_create_items(
                     # `processing` whenever the AI is fast enough to win the race.
                     await db.commit()
                     try:
-                        full_image_path = f"{settings.storage_path}/{image_paths['image_path']}"
                         job = await redis.enqueue_job(
                             "tag_item_image",
                             str(item.id),
-                            full_image_path,
+                            image_paths["image_path"],
                             _queue_name=TAGGING_QUEUE,
                         )
                         item.ai_job_id = job.job_id
@@ -662,11 +660,10 @@ async def bulk_analyze_items(
     try:
         for item, job_id in to_enqueue:
             try:
-                full_image_path = f"{settings.storage_path}/{item.image_path}"
                 job = await redis.enqueue_job(
                     "tag_item_image",
                     str(item.id),
-                    full_image_path,
+                    item.image_path,
                     _job_id=job_id,
                     _queue_name=TAGGING_QUEUE,
                 )
@@ -1560,11 +1557,10 @@ async def trigger_ai_analysis(
         try:
             redis = await create_pool(get_redis_settings())
             try:
-                full_image_path = f"{settings.storage_path}/{image_path}"
                 enqueued = await redis.enqueue_job(
                     "tag_item_image",
                     str(item_id),
-                    full_image_path,
+                    image_path,
                     _job_id=job_id,
                     _queue_name=TAGGING_QUEUE,
                 )
@@ -1591,11 +1587,10 @@ async def trigger_ai_analysis(
 
         redis = await create_pool(get_redis_settings())
         try:
-            full_image_path = f"{settings.storage_path}/{item.image_path}"
             job = await redis.enqueue_job(
                 "tag_item_image",
                 str(item.id),
-                full_image_path,
+                item.image_path,
                 _queue_name=TAGGING_QUEUE,
             )
             item.ai_job_id = job.job_id
