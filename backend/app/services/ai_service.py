@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 AI_RETRY_MAX_BACKOFF_S = 30
 
 
+class AIDisabledError(RuntimeError):
+    """Raised when an internal AI client is requested while that capability is off."""
+
+
 class _AIProviderResponseError(RuntimeError):
     pass
 
@@ -702,3 +706,17 @@ class AIService:
             "endpoints": endpoints_health,
         }
 
+
+
+# Global AI service instance
+_ai_service: AIService | None = None
+
+
+def get_ai_service() -> AIService:
+    """Return the shared AIService, or raise AIDisabledError if internal AI is off."""
+    if not get_settings().ai_enabled:
+        raise AIDisabledError("Internal AI is disabled; defer to an external agent.")
+    global _ai_service
+    if _ai_service is None:
+        _ai_service = AIService()
+    return _ai_service
