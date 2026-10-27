@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 AI_RETRY_MAX_BACKOFF_S = 30
 
 
+class AIDisabledError(RuntimeError):
+    """Raised when an internal AI client is requested while that capability is off."""
+
+
 class _AIProviderResponseError(RuntimeError):
     pass
 
@@ -332,12 +336,17 @@ class AIService:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    def _preprocess_image(self, image_path: str | Path) -> str:
+    def _preprocess_image(self, image_source: str | Path | bytes) -> str:
         """
         Preprocess image for AI analysis.
+        Accepts a file path (str or Path) or raw image bytes.
         Returns base64-encoded JPEG string.
         """
-        with Image.open(image_path) as img:
+        # Wrap bytes in BytesIO for PIL to read
+        if isinstance(image_source, bytes):
+            image_source = io.BytesIO(image_source)
+        
+        with Image.open(image_source) as img:
             # Convert to RGB if necessary
             if img.mode != "RGB":
                 img = img.convert("RGB")
@@ -584,10 +593,10 @@ class AIService:
             last_error.retryable = True
         return None, last_error, None
 
-    async def analyze_image(self, image_path: str | Path, *, locale: str) -> ClothingTags:
+    async def analyze_image(self, image: str | Path | bytes, *, locale: str) -> ClothingTags:
         # PIL preprocessing is CPU-bound and synchronous; run off the event loop so
         # concurrent tagging jobs don't stall each other's in-flight HTTP reads.
-        image_base64 = await asyncio.to_thread(self._preprocess_image, image_path)
+        image_base64 = await asyncio.to_thread(self._preprocess_image, image)
 
         # System/user separation for injection protection
         messages_tags = [
@@ -698,44 +707,34 @@ class AIService:
                         )
                         continue
 
-                    # Fallback: Try Ollama-specific endpoint
-                    response = await client.get(endpoint.url.replace("/v1", "/api/tags"))
-                    if response.status_code == 200:
-                        models = response.json().get("models", [])
-                        model_names = [m.get("name", "") for m in models]
-                        endpoints_health.append(
-                            {
-                                "name": endpoint.name,
-                                "url": endpoint.url,
-                                "status": "healthy",
-                                "vision_model": endpoint.vision_model,
-                                "text_model": endpoint.text_model,
-                                "available_models": model_names,
-                            }
-                        )
-                    else:
-                        endpoints_health.append(
-                            {
-                                "name": endpoint.name,
-                                "url": endpoint.url,
-                                "status": "unhealthy",
-                                "error": f"HTTP {response.status_code}",
-                            }
-                        )
+                    # Try OpenAI endpoint styles that return 404 for /models
+                    logger.debug(
+                        f"{endpoint.name} returned {response.status_code} for /models, "
+                        f"assuming offline or incompatible"
+                    )
+                    endpoints_health.append(
+                        {
+                            "name": endpoint.name,
+                            "url": endpoint.url,
+                            "status": "unknown",
+                            "vision_model": endpoint.vision_model,
+                            "text_model": endpoint.text_model,
+                            "available_models": [],
+                        }
+                    )
             except Exception as e:
+                logger.warning(f"Health check failed for {endpoint.name}: {e}")
                 endpoints_health.append(
                     {
                         "name": endpoint.name,
                         "url": endpoint.url,
-                        "status": "unhealthy",
+                        "status": "offline",
                         "error": str(e),
                     }
                 )
 
-        # Overall status is healthy if at least one endpoint is healthy
-        any_healthy = any(ep["status"] == "healthy" for ep in endpoints_health)
         return {
-            "status": "healthy" if any_healthy else "unhealthy",
+            "status": "healthy" if any(h.get("status") == "healthy" for h in endpoints_health) else "offline",
             "endpoints": endpoints_health,
         }
 
@@ -927,8 +926,17 @@ def _empty_response_error(
     )
 
 
-class AIDisabledError(RuntimeError):
-    """Raised when an internal AI client is requested while that capability is off."""
+_ai_service: AIService | None = None
+
+
+def get_ai_service() -> AIService:
+    """Return the shared AIService, or raise AIDisabledError if internal AI is off."""
+    if not get_settings().ai_enabled:
+        raise AIDisabledError("Internal AI is disabled; defer to an external agent.")
+    global _ai_service
+    if _ai_service is None:
+        _ai_service = AIService()
+    return _ai_service
 
 
 def require_internal_ai(capability: Literal["vision", "text"]) -> None:
@@ -944,22 +952,4 @@ def require_internal_ai(capability: Literal["vision", "text"]) -> None:
         else settings.effective_ai_text_enabled
     )
     if not enabled:
-        raise AIDisabledError(
-            f"Internal AI {capability} is disabled "
-            f"(AI_INTERNAL_ENABLED / AI_{capability.upper()}_ENABLED=false). "
-            "Defer this work to an external agent."
-        )
-
-
-# Singleton instance
-_ai_service: AIService | None = None
-
-
-def get_ai_service() -> AIService:
-    """Return the shared AIService, or raise AIDisabledError if internal AI is off."""
-    if not get_settings().ai_enabled:
-        raise AIDisabledError("Internal AI is disabled; defer to an external agent.")
-    global _ai_service
-    if _ai_service is None:
-        _ai_service = AIService()
-    return _ai_service
+        raise AIDisabledError(f"Internal AI {capability} is disabled; defer to an external agent.")
