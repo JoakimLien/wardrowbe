@@ -1,23 +1,20 @@
-from urllib.parse import urlparse
 from arq.connections import RedisSettings
+from redis.asyncio.connection import SSLConnection
 
 from app.config import get_settings
+from app.utils.redis_url import parse_redis_url
 
 settings = get_settings()
 
 
 def get_redis_settings() -> RedisSettings:
-    redis_url = str(settings.redis_url)
-    parsed = urlparse(redis_url)
-    
-    host = parsed.hostname or "localhost"
-    port = parsed.port or 6379
-    database = int(parsed.path.lstrip("/")) if parsed.path else 0
-    password = parsed.password
-    
+    options = parse_redis_url(settings.redis_url)
     return RedisSettings(
-        host=host,
-        port=port,
-        database=database,
-        password=password,
+        host=options.get("host", "localhost"),
+        port=options.get("port", 6379),
+        unix_socket_path=options.get("path"),
+        database=options.get("db", 0),
+        username=options.get("username"),
+        password=options.get("password"),
+        ssl=options.get("connection_class") is SSLConnection,
     )
